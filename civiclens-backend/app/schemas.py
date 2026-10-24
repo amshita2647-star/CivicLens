@@ -1,13 +1,22 @@
+import re
 from enum import Enum
 from typing import List, Optional
 
 from pydantic import (
     BaseModel,
     ConfigDict,
-    EmailStr,
     Field,
     field_validator,
 )
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clean_email(value: str) -> str:
+    value = value.strip().lower()
+    if not EMAIL_PATTERN.match(value):
+        raise ValueError("Enter a valid email address.")
+    return value
 
 
 # ==========================================
@@ -83,37 +92,42 @@ class UserProfileBase(BaseModel):
         return value or "Standard daily routine"
 
 
-class UserProfileCreate(UserProfileBase):
-    email: EmailStr
+# ==========================================
+# ACCOUNTS
+# ==========================================
+
+class SignupRequest(UserProfileBase):
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        return _clean_email(value)
 
 
-class UserProfileUpdate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+class LoginRequest(BaseModel):
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=1, max_length=200)
 
-    name: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        max_length=100,
-    )
-
-    locality: Optional[ChennaiLocality] = None
-    role: Optional[CitizenRole] = None
-
-    user_description: Optional[str] = Field(
-        default=None,
-        max_length=500,
-    )
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        return _clean_email(value)
 
 
-class UserProfileResponse(UserProfileBase):
-    id: int
-    email: EmailStr
-
-    model_config = ConfigDict(from_attributes=True)
+class AuthResponse(BaseModel):
+    citizen_id: str
+    email: str
+    name: str
+    locality: str
+    role: str
+    user_description: str
+    token: Optional[str] = None
 
 
 # ==========================================
-# ANALYSIS REQUEST
+# LOCALITY ANALYSIS
 # ==========================================
 
 class LocalityCheckRequest(BaseModel):
@@ -122,14 +136,10 @@ class LocalityCheckRequest(BaseModel):
     limit: int = Field(
         default=5,
         ge=1,
-        le=20,
+        le=10,
         description="Maximum number of notices to analyze",
     )
 
-
-# ==========================================
-# ANALYSIS RESPONSE
-# ==========================================
 
 class PolicyImpactItem(BaseModel):
     title: str
@@ -151,3 +161,25 @@ class PolicyAnalysisResponse(BaseModel):
     total_updates_found: int
     summary: str
     impact_items: List[PolicyImpactItem]
+
+
+# ==========================================
+# DOCUMENT ANALYSIS
+# ==========================================
+
+class DocumentAnalysisRequest(BaseModel):
+    user_profile: UserProfileBase
+
+    document_url: str = Field(
+        min_length=10,
+        max_length=2000,
+        description="Direct link to an official government notice or PDF",
+    )
+
+
+class DocumentAnalysisResponse(BaseModel):
+    citizen_name: str
+    locality: str
+    role: str
+    document_url: str
+    summary: str

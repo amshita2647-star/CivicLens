@@ -8,23 +8,35 @@ from functools import lru_cache
 from io import BytesIO
 from urllib.parse import urljoin, urlparse
 
+from typing import Optional
+
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from pypdf import PdfReader
 
 from app.schemas import (
+    AuthResponse,
+    DocumentAnalysisRequest,
+    DocumentAnalysisResponse,
     LocalityCheckRequest,
+    LoginRequest,
     PolicyAnalysisResponse,
     PolicyImpactItem,
+    SignupRequest,
+    UserProfileBase,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+from app import db as database
+
 
 # ------------------------------------------
 # CONFIGURATION
@@ -62,6 +74,9 @@ _notice_cache: dict[int, tuple[float, list[dict]]] = {}
 _notice_lock = asyncio.Lock()
 _analysis_cache: dict[str, tuple[float, str]] = {}
 
+# Keeps references to background save tasks so they are not garbage collected.
+_background_tasks: set[asyncio.Task] = set()
+
 
 # ------------------------------------------
 # APP SETUP
@@ -91,8 +106,10 @@ app = FastAPI(
 )
 
 # Set FRONTEND_ORIGINS to comma-separated URLs during deployment.
+# Local Streamlit origins are always allowed for development.
 origins_env = os.getenv("FRONTEND_ORIGINS", "")
 allowed_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+allowed_origins += ["http://localhost:8501", "http://127.0.0.1:8501"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,12 +145,17 @@ def get_gemini_client() -> genai.Client:
     return _build_client(api_key)
 
 
-def build_generation_config() -> types.GenerateContentConfig:
+def build_generation_config(
+    system_instruction: Optional[str] = None,
+) -> types.GenerateContentConfig:
     """Fast, short responses. Thinking is disabled only on 2.5 Flash models."""
     kwargs = {
         "temperature": 0.3,
         "max_output_tokens": 600,
     }
+
+    if system_instruction:
+        kwargs["system_instruction"] = system_instruction
 
     if "2.5-flash" in MODEL_ID:
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
@@ -410,6 +432,239 @@ def store_analysis(key: str, text: str) -> None:
     _analysis_cache[key] = (time.time(), text)
 
 
+def extract_token(authorization: Optional[str]) -> Optional[str]:
+    """Read the session token from an 'Authorization: Bearer <token>' header."""
+    if not authorization:
+        return None
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    return value.strip()
+
+
+def save_in_background(
+    token: Optional[str],
+    locality: str,
+    notices_found: int,
+    analysis: str,
+) -> None:
+    """Log the check for the signed-in citizen without delaying the response."""
+    if not token:
+        return
+
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            database.save_check,
+            token,
+            locality,
+            notices_found,
+            analysis,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+# ------------------------------------------
+# GOVERNMENT DOCUMENT ANALYSIS
+# ------------------------------------------
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+DOCUMENT_HOST_SUFFIXES = (".gov.in", ".nic.in")
+DOCUMENT_READ_TIMEOUT = 20
+MAX_DOC_PDF_PAGES = 10
+MAX_CHARS_DOCUMENT = 8000
+
+DOCUMENT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.8",
+}
+
+DOCUMENT_SYSTEM_INSTRUCTION = (
+    "You are CivicLens Chennai. Explain official government documents "
+    "in simple, everyday language.\n"
+    "Rules:\n"
+    "1. Keep your entire answer very short (under 150 words).\n"
+    "2. Address the citizen directly by name.\n"
+    "3. Use simple bullet points to explain: What this document is, "
+    "How it affects them, and What action they need to take.\n"
+    "4. Avoid complex legal jargon or long paragraphs.\n"
+    "5. Use only facts found in the document. Do not invent dates, "
+    "deadlines or decisions. If something is unclear, say so."
+)
+
+
+def is_allowed_document_host(hostname: Optional[str]) -> bool:
+    """Only official government domains may be downloaded."""
+    if not hostname:
+        return False
+    hostname = hostname.lower()
+    return hostname in ("gov.in", "nic.in") or hostname.endswith(
+        DOCUMENT_HOST_SUFFIXES
+    )
+
+
+def download_document(url: str) -> tuple[bytes, str]:
+    """Download a government document; returns (content, content_type)."""
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https") or not is_allowed_document_host(
+        parsed.hostname
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only official government links "
+                "(ending in .gov.in or .nic.in) are supported."
+            ),
+        )
+
+    try:
+        try:
+            response = HTTP.get(
+                url,
+                headers=DOCUMENT_HEADERS,
+                timeout=(CONNECT_TIMEOUT, DOCUMENT_READ_TIMEOUT),
+            )
+        except requests.exceptions.SSLError:
+            # Some state portals have misconfigured certificates.
+            # The host was already verified as a government domain above.
+            logger.warning("SSL error for %s; retrying without verification.",
+                           parsed.hostname)
+            response = HTTP.get(
+                url,
+                headers=DOCUMENT_HEADERS,
+                timeout=(CONNECT_TIMEOUT, DOCUMENT_READ_TIMEOUT),
+                verify=False,
+            )
+
+        response.raise_for_status()
+
+    except requests.RequestException:
+        logger.exception("Could not download the document.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not download the document from that link.",
+        )
+
+    # A redirect must not lead outside government domains.
+    if not is_allowed_document_host(urlparse(response.url).hostname):
+        raise HTTPException(
+            status_code=400,
+            detail="That link redirects to a non-government website.",
+        )
+
+    if len(response.content) > MAX_DOWNLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The document is too large to analyze (limit 5 MB).",
+        )
+
+    return response.content, response.headers.get("Content-Type", "").lower()
+
+
+def extract_document_text(
+    content: bytes, content_type: str, url: str
+) -> tuple[str, bool]:
+    """Return (text, is_pdf) for a downloaded PDF or web page."""
+
+    is_pdf = (
+        "application/pdf" in content_type
+        or urlparse(url).path.lower().endswith(".pdf")
+        or content.startswith(b"%PDF-")
+    )
+
+    text = ""
+
+    if is_pdf:
+        try:
+            reader = PdfReader(BytesIO(content))
+            parts = []
+            for page in reader.pages[:MAX_DOC_PDF_PAGES]:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    parts.append(page_text)
+            text = "\n".join(parts)
+        except Exception:
+            logger.exception("PDF text extraction failed.")
+    else:
+        soup = BeautifulSoup(content, "html.parser")
+        for element in soup(
+            ["script", "style", "nav", "footer", "header", "noscript"]
+        ):
+            element.decompose()
+        body = soup.find("main") or soup.find("article") or soup
+        text = body.get_text(separator=" ", strip=True)
+
+    return text.strip()[:MAX_CHARS_DOCUMENT], is_pdf
+
+
+def run_document_analysis(
+    name: str,
+    locality: str,
+    role: str,
+    description: str,
+    document_url: str,
+) -> str:
+    """Download, read and explain a government document for one citizen."""
+
+    content, content_type = download_document(document_url)
+    text, is_pdf = extract_document_text(content, content_type, document_url)
+
+    client = get_gemini_client()
+
+    profile = (
+        "CITIZEN PROFILE:\n"
+        f"- Name: {name}\n"
+        f"- Locality/Zone: {locality}\n"
+        f"- Role: {role}\n"
+        f"- Daily context: {description}\n"
+    )
+
+    if len(text) > 100:
+        contents = f"{profile}\nGOVERNMENT DOCUMENT TEXT:\n{text}"
+    elif is_pdf:
+        # Scanned PDF: let Gemini read the file directly.
+        contents = [
+            types.Part.from_bytes(data=content, mime_type="application/pdf"),
+            f"{profile}\nAnalyze the attached PDF and explain its impact "
+            "on this citizen.",
+        ]
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text was found at that link.",
+        )
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=contents,
+            config=build_generation_config(DOCUMENT_SYSTEM_INSTRUCTION),
+        )
+
+        summary = (response.text or "").strip()
+        if not summary:
+            raise RuntimeError("Gemini returned an empty response.")
+
+        return summary
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Gemini document analysis failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="AI analysis is temporarily unavailable.",
+        ) from exc
+
+
 # ------------------------------------------
 # HEALTH CHECK
 # ------------------------------------------
@@ -430,7 +685,10 @@ async def health_check():
     "/api/v1/locality-check",
     response_model=PolicyAnalysisResponse,
 )
-async def check_locality(payload: LocalityCheckRequest):
+async def check_locality(
+    payload: LocalityCheckRequest,
+    authorization: Optional[str] = Header(default=None),
+):
     user = payload.user_profile
 
     name = user.name.strip()
@@ -460,7 +718,15 @@ async def check_locality(payload: LocalityCheckRequest):
             )
             store_analysis(key, ai_analysis_text)
 
-        # 5. Build the response.
+        # 5. Log this check for the signed-in citizen (background, never blocks).
+        save_in_background(
+            extract_token(authorization),
+            locality,
+            len(notices),
+            ai_analysis_text,
+        )
+
+        # 6. Build the response.
         impact_items = [
             PolicyImpactItem(
                 title=f"GCC Updates for {locality}",
@@ -493,3 +759,161 @@ async def check_locality(payload: LocalityCheckRequest):
             status_code=502,
             detail="Unable to complete the locality analysis. Please try again.",
         ) from exc
+
+
+# ------------------------------------------
+# DOCUMENT ANALYSIS ENDPOINT
+# ------------------------------------------
+
+@app.post(
+    "/api/v1/analyze-document",
+    response_model=DocumentAnalysisResponse,
+)
+async def analyze_document(payload: DocumentAnalysisRequest):
+    user = payload.user_profile
+
+    name = user.name.strip()
+    locality = user.locality.value
+    role = user.role.value
+    description = (user.user_description or "Standard daily routine").strip()
+    document_url = payload.document_url.strip()
+
+    try:
+        summary = await asyncio.to_thread(
+            run_document_analysis,
+            name,
+            locality,
+            role,
+            description,
+            document_url,
+        )
+
+        return DocumentAnalysisResponse(
+            citizen_name=name,
+            locality=locality,
+            role=role,
+            document_url=document_url,
+            summary=summary,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception("Document analysis request failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to analyze the document. Please try again.",
+        ) from exc
+
+
+# ------------------------------------------
+# ACCOUNT ENDPOINTS (sign up, log in, profile)
+# ------------------------------------------
+
+@app.post(
+    "/api/v1/auth/signup",
+    response_model=AuthResponse,
+    status_code=201,
+)
+async def signup(payload: SignupRequest):
+    try:
+        result = await asyncio.to_thread(
+            database.signup,
+            payload.email,
+            payload.password,
+            payload.name,
+            payload.locality.value,
+            payload.role.value,
+            payload.user_description or "Standard daily routine",
+        )
+    except database.EmailExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists. Please log in.",
+        )
+    except database.DatabaseUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="The database is not configured.",
+        )
+    except Exception as exc:
+        logger.exception("Sign-up failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not create the account. Please try again.",
+        ) from exc
+
+    return AuthResponse(**result)
+
+
+@app.post("/api/v1/auth/login", response_model=AuthResponse)
+async def login(payload: LoginRequest):
+    try:
+        result = await asyncio.to_thread(
+            database.login,
+            payload.email,
+            payload.password,
+        )
+    except database.DatabaseUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="The database is not configured.",
+        )
+    except Exception as exc:
+        logger.exception("Login failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not log in. Please try again.",
+        ) from exc
+
+    if result is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password.",
+        )
+
+    return AuthResponse(**result)
+
+
+@app.put("/api/v1/profile", response_model=AuthResponse)
+async def update_profile(
+    payload: UserProfileBase,
+    authorization: Optional[str] = Header(default=None),
+):
+    token = extract_token(authorization)
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired. Please log in again.",
+        )
+
+    try:
+        result = await asyncio.to_thread(
+            database.update_profile,
+            token,
+            payload.name.strip(),
+            payload.locality.value,
+            payload.role.value,
+            (payload.user_description or "Standard daily routine").strip(),
+        )
+    except database.DatabaseUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="The database is not configured.",
+        )
+    except Exception as exc:
+        logger.exception("Profile update failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not update the profile. Please try again.",
+        ) from exc
+
+    if result is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired. Please log in again.",
+        )
+
+    return AuthResponse(**result)
