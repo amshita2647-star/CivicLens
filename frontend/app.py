@@ -8,7 +8,7 @@ load_dotenv()
 
 BACKEND_URL = os.getenv(
     "CIVICLENS_BACKEND_URL",
-    "http://127.0.0.1:8000",
+    "https://civiclens-6cab.onrender.com",
 ).rstrip("/")
 
 REQUEST_TIMEOUT = 120  # seconds; allows for a sleeping free-tier backend
