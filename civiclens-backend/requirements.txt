@@ -7,3 +7,4 @@ requests>=2.31,<3.0
 beautifulsoup4>=4.12,<5.0
 pypdf>=5.0,<7.0
 supabase>=2.0
+bcrypt
